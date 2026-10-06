@@ -1,12 +1,10 @@
 from pathlib import Path
 
-from fontTools.ttLib import TTFont
+from fontTools.ttLib import TTFont, TTCollection
 
 
-def read_segoe_identity(segoe_path):
-    font = TTFont(segoe_path)
-    try:
-        identity = {
+def _read_identity(font):
+    identity = {
             "macStyle": font["head"].macStyle,
             "os2_version": font["OS/2"].version,
             "os2_weight": font["OS/2"].usWeightClass,
@@ -16,33 +14,113 @@ def read_segoe_identity(segoe_path):
             "name_records": [],
         }
 
+    try:
+        identity["os2_panose"] = font["OS/2"].panose
+    except AttributeError:
+        identity["os2_panose"] = None
+
+    if hasattr(font["OS/2"], "usLowerOpticalPointSize"):
+        identity["usLowerOpticalPointSize"] = font["OS/2"].usLowerOpticalPointSize
+    if hasattr(font["OS/2"], "usUpperOpticalPointSize"):
+        identity["usUpperOpticalPointSize"] = font["OS/2"].usUpperOpticalPointSize
+
+    for record in font["name"].names:
         try:
-            identity["os2_panose"] = font["OS/2"].panose
-        except AttributeError:
-            identity["os2_panose"] = None
+            identity["name_records"].append(
+                {
+                    "nameID": record.nameID,
+                    "platformID": record.platformID,
+                    "platEncID": record.platEncID,
+                    "langID": record.langID,
+                    "string": record.toUnicode(),
+                }
+            )
+        except UnicodeDecodeError:
+            continue
 
-        if hasattr(font["OS/2"], "usLowerOpticalPointSize"):
-            identity["usLowerOpticalPointSize"] = font["OS/2"].usLowerOpticalPointSize
-        if hasattr(font["OS/2"], "usUpperOpticalPointSize"):
-            identity["usUpperOpticalPointSize"] = font["OS/2"].usUpperOpticalPointSize
+    return identity
 
-        for record in font["name"].names:
-            try:
-                identity["name_records"].append(
-                    {
-                        "nameID": record.nameID,
-                        "platformID": record.platformID,
-                        "platEncID": record.platEncID,
-                        "langID": record.langID,
-                        "string": record.toUnicode(),
-                    }
-                )
-            except UnicodeDecodeError:
-                continue
 
-        return identity
+def read_segoe_identity(segoe_path):
+    font = TTFont(segoe_path)
+    try:
+        identity = _read_identity(font)
     finally:
         font.close()
+    return identity
+
+
+def read_collection_identities(ttc_path) -> list[dict]:
+    """Identity of every face in a donor .ttc, in collection order."""
+    collection = TTCollection(str(ttc_path), lazy=False)
+    try:
+        return [_read_identity(font) for font in collection.fonts]
+    finally:
+        collection.close()
+
+
+def _open_source_face(source_path: Path, target_weight: int):
+    """Open the source face closest to the donor face's weight.
+
+    A plain .ttf yields its single face; a .ttc yields the face whose
+    OS/2.usWeightClass is nearest (preferring non-italic faces).
+    """
+    if source_path.suffix.lower() != ".ttc":
+        return TTFont(str(source_path), lazy=False)
+
+    from font_detection import count_collection_faces, inspect_font
+
+    best_index = 0
+    best_diff = None
+    for index in range(count_collection_faces(source_path)):
+        metadata = inspect_font(source_path, index)
+        diff = abs(metadata.weight_class - target_weight) + (50 if metadata.is_italic else 0)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_index = index
+
+    return TTFont(str(source_path), fontNumber=best_index, lazy=False)
+
+
+def build_ttc_font(source_path, donor_ttc_path, output_path):
+    """Build a .ttc whose faces keep every donor face's identity.
+
+    Microsoft YaHei collections contain several faces (Microsoft YaHei,
+    Microsoft YaHei UI, Light variants ...). Each donor face's name and
+    OS/2 identity is transplanted onto the user's font so Windows keeps
+    resolving every requested face name to the replaced file.
+    """
+    source_path = Path(source_path)
+    donor_ttc_path = Path(donor_ttc_path)
+    output_path = Path(output_path)
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"Font not found: {source_path}")
+    if not donor_ttc_path.exists():
+        raise FileNotFoundError(f"System font not found: {donor_ttc_path}")
+
+    identities = read_collection_identities(donor_ttc_path)
+    if not identities:
+        raise RuntimeError(f"Donor collection contains no faces: {donor_ttc_path.name}")
+
+    built_fonts = []
+    try:
+        for identity in identities:
+            font = _open_source_face(source_path, identity["os2_weight"])
+            built_fonts.append(font)
+            apply_identity(font, identity)
+
+        collection = TTCollection()
+        collection.fonts = built_fonts
+        collection.save(str(output_path))
+    finally:
+        for font in built_fonts:
+            try:
+                font.close()
+            except Exception:
+                pass
+
+    return str(output_path)
 
 
 def apply_identity(font, identity):

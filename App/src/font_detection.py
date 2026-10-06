@@ -6,7 +6,29 @@ from pathlib import Path
 
 from fontTools.ttLib import TTFont
 
-from settings import FONT_EXTENSIONS, WEIGHT_TARGETS
+from settings import (
+    CJK_REQUIRED_WEIGHTS,
+    SOURCE_FONT_EXTENSIONS,
+    WEIGHT_TARGETS,
+)
+
+
+# A sample of GB2312 level-1 (一 级) Han characters, the most frequently used
+# simplified Chinese. Coverage of this sample is what decides whether a font
+# can stand in for Microsoft YaHei: real Simplified Chinese fonts score 100%,
+# Japanese/Korean fonts only 45-75% (they carry a Kanji subset but not the
+# simplified forms), and Latin-only fonts 0%.
+_CJK_PROBE_CODEPOINTS = frozenset({
+    0x4E00, 0x4E01, 0x4E03, 0x4E08, 0x4E09, 0x4E0A, 0x4E0B, 0x4E0D, 0x4E0E,
+    0x4E10, 0x4E12, 0x4E14, 0x4E15, 0x4E18, 0x4E19, 0x4E1A, 0x4E1B, 0x4E1C,
+    0x4E1D, 0x4E20, 0x4E22, 0x4E24, 0x4E25, 0x4E26, 0x4E27, 0x4E28, 0x4E29,
+    0x4E2A, 0x4E2B, 0x4E2C, 0x4E2D, 0x4E2E, 0x4E2F, 0x4E30, 0x4E31, 0x4E32,
+    0x4E33, 0x4E34, 0x4E35, 0x4E36,
+})
+# Measured on Windows 11: YaHei/SimSun/Segoe UI score 100%, MS Gothic and
+# Yu Gothic 75%, Malgun Gothic 45%, Arial/Tahoma 0%. The 85% gate keeps a
+# wide margin below real Chinese fonts while excluding the CJK subset fonts.
+_CJK_COVERAGE_MIN_RATIO = 0.85
 
 
 @dataclass
@@ -21,6 +43,9 @@ class FontMetadata:
     is_italic: bool = False
     is_variable: bool = False
     is_monospace: bool = False
+    covers_cjk: bool = False
+    face_count: int = 1
+    face_index: int = 0
 
 
 WEIGHT_REGEX = [
@@ -67,20 +92,70 @@ def classify_weight_from_strings(*values):
     return "regular"
 
 
+def count_collection_faces(path: str | os.PathLike[str]) -> int:
+    """Number of faces in a .ttc collection (1 for plain .ttf)."""
+    font_path = Path(path)
+    if font_path.suffix.lower() != ".ttc":
+        return 1
+    try:
+        with open(font_path, "rb") as handle:
+            return _read_collection_face_count(handle)
+    except Exception:
+        return 1
+
+
+def _read_collection_face_count(handle) -> int:
+    """Read the face count straight from the TTC header.
+
+    Avoids a full fontTools parse (and a second file open) just to learn how
+    many faces the collection has.
+    """
+    handle.seek(0)
+    header = handle.read(12)
+    if len(header) < 12 or header[:4] != b"ttcf":
+        return 1
+    return max(1, int.from_bytes(header[8:12], "big"))
+
+
+def _font_covers_cjk(font) -> bool:
+    try:
+        cmap = font.getBestCmap()
+    except Exception:
+        return False
+    if not cmap:
+        return False
+    hits = sum(1 for codepoint in _CJK_PROBE_CODEPOINTS if codepoint in cmap)
+    return hits >= _CJK_COVERAGE_MIN_RATIO * len(_CJK_PROBE_CODEPOINTS)
+
+
+def _font_signature(font_path: Path):
+    """Identity of a file's current content, so cached metadata is dropped
+    when the user swaps or rewrites a font at the same path."""
+    try:
+        stat = font_path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
 @lru_cache(maxsize=1024)
-def _inspect_font_cached(font_path_str: str) -> FontMetadata:
+def _inspect_font_cached(font_path_str: str, face_index: int, signature) -> FontMetadata:
     font_path = Path(font_path_str)
     extension = font_path.suffix.lower()
-    if extension not in FONT_EXTENSIONS:
+    if extension not in SOURCE_FONT_EXTENSIONS:
         raise ValueError(f"Unsupported font type: {font_path.suffix}")
     try:
-        font = TTFont(font_path)
+        font = TTFont(font_path, fontNumber=face_index)
     except Exception as exc:
         raise ValueError(f"This font file is corrupted or unreadable: {font_path.name}") from exc
 
     try:
         for req in ("head", "name", "OS/2", "glyf", "loca"):
             if req not in font:
+                if extension == ".ttc":
+                    raise ValueError(
+                        f"Only TrueType collections with glyf outlines are supported (.ttc): {font_path.name}"
+                    )
                 raise ValueError(f"This font file is corrupted or missing standard TrueType '{req}' table: {font_path.name}")
 
         try:
@@ -131,6 +206,9 @@ def _inspect_font_cached(font_path_str: str) -> FontMetadata:
         except Exception:
             units_per_em = 1000
 
+        covers_cjk = _font_covers_cjk(font)
+        face_count = count_collection_faces(font_path)
+
         metadata = FontMetadata(
             path=font_path,
             extension=extension,
@@ -142,6 +220,9 @@ def _inspect_font_cached(font_path_str: str) -> FontMetadata:
             is_italic=is_italic,
             is_variable="fvar" in font,
             is_monospace=is_mono,
+            covers_cjk=covers_cjk,
+            face_count=face_count,
+            face_index=face_index,
         )
     except ValueError:
         raise
@@ -152,8 +233,9 @@ def _inspect_font_cached(font_path_str: str) -> FontMetadata:
     return metadata
 
 
-def inspect_font(path: str | os.PathLike[str]) -> FontMetadata:
-    return _inspect_font_cached(str(Path(path).resolve()))
+def inspect_font(path: str | os.PathLike[str], face_index: int = 0) -> FontMetadata:
+    font_path = Path(path).resolve()
+    return _inspect_font_cached(str(font_path), face_index, _font_signature(font_path))
 
 
 def classify_weight(path, metadata=None):
@@ -225,7 +307,7 @@ def detect_weight_overrides(primary_path, existing=None, weights=None, manual_ov
     all_candidates = []
     variable_candidates = []
     for candidate in folder.iterdir():
-        if not candidate.is_file() or candidate.suffix.lower() not in FONT_EXTENSIONS:
+        if not candidate.is_file() or candidate.suffix.lower() not in SOURCE_FONT_EXTENSIONS:
             continue
         try:
             metadata = inspect_font(candidate)
@@ -277,10 +359,32 @@ def detect_weight_overrides(primary_path, existing=None, weights=None, manual_ov
         target_value, target_italic = WEIGHT_TARGETS[target_weight]
         is_mono_target = target_weight.startswith("consolas_")
 
+        if target_weight in CJK_REQUIRED_WEIGHTS:
+            # YaHei slots may only be filled with fonts that render Simplified
+            # Chinese; leave them unset rather than silently replacing
+            # Microsoft YaHei with a Latin-only or Japanese/Korean font.
+            eligible_candidates = [
+                (candidate, metadata)
+                for candidate, metadata in all_candidates
+                if metadata.covers_cjk
+            ]
+            if not eligible_candidates:
+                continue
+        else:
+            # Segoe UI / Consolas replacements are always built as a single
+            # plain .ttf, so a collection must never be auto-selected here.
+            eligible_candidates = [
+                (candidate, metadata)
+                for candidate, metadata in all_candidates
+                if metadata.extension != ".ttc"
+            ]
+            if not eligible_candidates:
+                eligible_candidates = [(primary, primary_metadata)]
+
         best_cand = None
         best_score = float("-inf")
 
-        for candidate, metadata in all_candidates:
+        for candidate, metadata in eligible_candidates:
             score = _score_candidate(
                 candidate,
                 metadata,
@@ -297,8 +401,9 @@ def detect_weight_overrides(primary_path, existing=None, weights=None, manual_ov
 
         if best_cand is not None:
             detected[target_weight] = str(best_cand.resolve())
-        else:
+        elif target_weight not in CJK_REQUIRED_WEIGHTS:
             detected[target_weight] = str(primary)
+        # CJK slots with no qualifying candidate stay unset.
 
     return detected
 

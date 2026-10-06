@@ -2,10 +2,10 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fontTools.ttLib import TTFont
+from fontTools.ttLib import TTFont, TTCollection
 
 from font_cache import refresh_windows_font_cache
-from font_generation import build_font
+from font_generation import build_font, build_ttc_font
 from fonts import validate_selection
 from operation_files import (
     backup_canonical_fonts,
@@ -47,9 +47,21 @@ class FontWorkflow:
         from settings import get_system_weights
         return get_system_weights(self.identity_fonts_root)
 
-    def _system_font_files(self):
+    def _system_font_files(self, entry_weights=None):
+        """System files to back up / schedule.
+
+        With entry_weights given, only the files behind those weights (plus the
+        mono companions) are returned; otherwise every known system font is
+        included. Restoring must pass the weights that were actually replaced,
+        so untouched files are never hashed or staged for replacement.
+        """
         from settings import get_existing_mono_companions
-        files = list(dict.fromkeys(self._system_weights().values()))
+        weights = self._system_weights()
+        if entry_weights is not None:
+            selected = {weights[w] for w in entry_weights if w in weights}
+        else:
+            selected = set(weights.values())
+        files = list(dict.fromkeys(selected))
         target_dir = self.identity_fonts_root if self.identity_fonts_root.exists() else self.active_fonts_root
         for companion_file in get_existing_mono_companions(target_dir):
             if companion_file not in files:
@@ -80,7 +92,12 @@ class FontWorkflow:
             return OperationResult(False, summary.errors[0] if summary.errors else "The selected font cannot be used.", summary.errors, summary.warnings)
 
         stage_dir = self.paths.make_temp_dir("fontwizard-build-")
-        system_files = self._system_font_files()
+        # Back up only the system files that are actually going to be
+        # replaced (plus mono companions). Optional slots that were left
+        # unset, such as Microsoft YaHei, are not touched at all.
+        system_files = self._system_font_files(
+            entry_weights=[entry.weight for entry in summary.entries]
+        )
 
         try:
             self._emit(progress, 5, "Backing up original Windows system fonts...")
@@ -152,12 +169,40 @@ class FontWorkflow:
         finally:
             shutil.rmtree(stage_dir, ignore_errors=True)
 
+    def _replaced_font_files(self):
+        """System files recorded as replaced by the last apply.
+
+        Falls back to every known system font when no usable manifest exists
+        (for example after a manual repair), so restore still does its job.
+        """
+        try:
+            state = self.state_store.load() or {}
+            fonts = (state.get("install") or {}).get("fonts") or {}
+            names = {
+                str(entry["system_filename"])
+                for entry in fonts.values()
+                if isinstance(entry, dict) and entry.get("system_filename")
+            }
+            if names:
+                target_dir = (
+                    self.identity_fonts_root
+                    if self.identity_fonts_root.exists()
+                    else self.active_fonts_root
+                )
+                from settings import get_existing_mono_companions
+                for companion in get_existing_mono_companions(target_dir):
+                    names.add(companion)
+                return sorted(names)
+        except Exception:
+            pass
+        return self._system_font_files()
+
     def restore(self, progress=None):
         report = self.preflight.collect()
         if not report.is_admin:
             return OperationResult(False, "Run Font Wizard as Administrator before restoring fonts.", report.issues, report.warnings)
 
-        system_files = self._system_font_files()
+        system_files = self._replaced_font_files()
 
         try:
             self._emit(progress, 10, "Cleaning up stale pending files...")
@@ -217,6 +262,22 @@ class FontWorkflow:
             callback(value, message)
 
 
+def _face_identity_snapshot(font):
+    """The identity fields a replacement font must match on, so that Windows
+    still resolves the original family/weight names to the built file."""
+    return {
+        "family_name": font["name"].getBestFamilyName(),
+        "full_name": font["name"].getBestFullName(),
+        "subfamily_name": font["name"].getBestSubFamilyName(),
+        "mac_style": font["head"].macStyle,
+        "os2_version": font["OS/2"].version,
+        "weight_class": font["OS/2"].usWeightClass,
+        "width_class": font["OS/2"].usWidthClass,
+        "fs_selection": font["OS/2"].fsSelection,
+        "italic_angle": font["post"].italicAngle,
+    }
+
+
 def _verify_build_output(output_path: Path, segoe_path: Path):
     built_font = None
     donor_font = None
@@ -231,28 +292,8 @@ def _verify_build_output(output_path: Path, segoe_path: Path):
         except Exception as exc:
             raise RuntimeError(f"Could not inspect donor font: {segoe_path.name}") from exc
 
-        expected = {
-            "family_name": donor_font["name"].getBestFamilyName(),
-            "full_name": donor_font["name"].getBestFullName(),
-            "subfamily_name": donor_font["name"].getBestSubFamilyName(),
-            "mac_style": donor_font["head"].macStyle,
-            "os2_version": donor_font["OS/2"].version,
-            "weight_class": donor_font["OS/2"].usWeightClass,
-            "width_class": donor_font["OS/2"].usWidthClass,
-            "fs_selection": donor_font["OS/2"].fsSelection,
-            "italic_angle": donor_font["post"].italicAngle,
-        }
-        actual = {
-            "family_name": built_font["name"].getBestFamilyName(),
-            "full_name": built_font["name"].getBestFullName(),
-            "subfamily_name": built_font["name"].getBestSubFamilyName(),
-            "mac_style": built_font["head"].macStyle,
-            "os2_version": built_font["OS/2"].version,
-            "weight_class": built_font["OS/2"].usWeightClass,
-            "width_class": built_font["OS/2"].usWidthClass,
-            "fs_selection": built_font["OS/2"].fsSelection,
-            "italic_angle": built_font["post"].italicAngle,
-        }
+        expected = _face_identity_snapshot(donor_font)
+        actual = _face_identity_snapshot(built_font)
 
         for key, expected_value in expected.items():
             if actual[key] != expected_value:
@@ -267,6 +308,43 @@ def _verify_build_output(output_path: Path, segoe_path: Path):
             built_font.close()
         if donor_font is not None:
             donor_font.close()
+
+
+def _verify_collection_output(output_path: Path, donor_ttc_path: Path):
+    built_collection = None
+    donor_collection = None
+    try:
+        try:
+            built_collection = TTCollection(str(output_path))
+        except Exception as exc:
+            raise RuntimeError(f"Built collection could not be reopened: {output_path.name}") from exc
+        try:
+            donor_collection = TTCollection(str(donor_ttc_path))
+        except Exception as exc:
+            raise RuntimeError(f"Could not inspect donor collection: {donor_ttc_path.name}") from exc
+
+        if len(built_collection.fonts) != len(donor_collection.fonts):
+            raise RuntimeError(
+                f"Built collection face count mismatch for {output_path.name}: "
+                f"{len(built_collection.fonts)} vs {len(donor_collection.fonts)} donor faces."
+            )
+
+        for index, (built_font, donor_font) in enumerate(
+            zip(built_collection.fonts, donor_collection.fonts)
+        ):
+            expected = _face_identity_snapshot(donor_font)
+            actual = _face_identity_snapshot(built_font)
+            for key, expected_value in expected.items():
+                if actual[key] != expected_value:
+                    raise RuntimeError(
+                        f"Built font identity check failed for {output_path.name} face {index}: "
+                        f"{key} was {actual[key]!r}, expected {expected_value!r}."
+                    )
+    finally:
+        if built_collection is not None:
+            built_collection.close()
+        if donor_collection is not None:
+            donor_collection.close()
 
 
 def build_artifacts(workflow, entries, stage_dir):
@@ -286,9 +364,13 @@ def build_artifacts(workflow, entries, stage_dir):
         if entry.system_filename.lower() == "seguivar.ttf":
             from font_generation import build_variable_font
             build_variable_font(entry.source_path, segoe_path, output_path)
+            _verify_build_output(output_path, segoe_path)
+        elif entry.system_filename.lower().endswith(".ttc"):
+            build_ttc_font(entry.source_path, segoe_path, output_path)
+            _verify_collection_output(output_path, segoe_path)
         else:
             build_font(entry.source_path, segoe_path, output_path)
-        _verify_build_output(output_path, segoe_path)
+            _verify_build_output(output_path, segoe_path)
 
         artifacts[entry.weight] = {
             "weight": entry.weight,

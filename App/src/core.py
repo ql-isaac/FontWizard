@@ -6,6 +6,7 @@ from checks import PreflightService
 from font_detection import detect_weight_overrides, inspect_font
 from operation import FontWorkflow
 from app_state import ManagedStateStore
+from settings import OPTIONAL_WEIGHTS, is_yahei_weight
 from win_registry import WindowsFontRegistry
 
 
@@ -73,6 +74,14 @@ class FontWizardController:
             raise ValueError(
                 "Variable fonts cannot be selected as the primary static font. Select a static font (Regular) here, and assign your variable font to the Variable UI Font slot."
             )
+        if metadata.extension == ".ttc":
+            # The primary font feeds every Segoe UI / Consolas slot, all of
+            # which are plain .ttf. Collections are only valid for the
+            # Microsoft YaHei slots.
+            raise ValueError(
+                "TrueType Collections (.ttc) cannot be used as the primary font. "
+                "Choose a plain .ttf file here, then assign your .ttc to the Microsoft YaHei cards."
+            )
 
         resolved_path = str(Path(path).resolve())
         self.primary_font_path = resolved_path
@@ -82,14 +91,28 @@ class FontWizardController:
 
         detected = detect_weight_overrides(resolved_path, weights=system_weights)
 
+        # YaHei is replaced as a set: if any YaHei slot resolved to a
+        # CJK-capable font, use that one font for all YaHei slots.
+        yahei_source = next(
+            (detected.get(w) for w in system_weights if w in OPTIONAL_WEIGHTS and detected.get(w)),
+            None,
+        )
+
         paths["regular"] = resolved_path
         labels["regular"] = "primary"
         for weight in system_weights:
             if weight == "regular":
                 continue
             detected_path = detected.get(weight)
-            paths[weight] = detected_path or resolved_path
-            labels[weight] = "auto-detected"
+            if weight in OPTIONAL_WEIGHTS:
+                # Microsoft YaHei slots are only filled when a CJK-capable
+                # font was found in the same folder; otherwise they stay
+                # unset and the original YaHei files are left untouched.
+                paths[weight] = yahei_source
+                labels[weight] = "auto-detected" if yahei_source else "unset"
+            else:
+                paths[weight] = detected_path or resolved_path
+                labels[weight] = "auto-detected"
 
     def set_card_override(self, weight, path):
         metadata = inspect_font(path)
@@ -97,9 +120,22 @@ class FontWizardController:
             raise ValueError(
                 "Variable fonts can only be assigned to the Variable UI slot. Choose a static .ttf file for static weights."
             )
+        if is_yahei_weight(weight) and not metadata.covers_cjk:
+            raise ValueError(
+                f"{Path(path).name} does not contain Chinese (CJK) glyphs. "
+                "Choose a Chinese-capable TrueType font (.ttf/.ttc) for Microsoft YaHei."
+            )
         resolved_path = str(Path(path).resolve())
         self.selection.paths[weight] = resolved_path
         self.selection.labels[weight] = "manual"
+
+        if is_yahei_weight(weight):
+            # YaHei is replaced as a set, so assigning one slot assigns them
+            # all; otherwise the system would be left half-replaced.
+            from settings import YAHEI_WEIGHTS
+            for yahei_weight in YAHEI_WEIGHTS:
+                self.selection.paths[yahei_weight] = resolved_path
+                self.selection.labels[yahei_weight] = "manual"
 
         if weight.startswith("consolas_"):
             from settings import CONSOLAS_WEIGHTS
@@ -142,6 +178,20 @@ class FontWizardController:
                 detected_from_primary = detect_weight_overrides(primary_path, weights={weight: system_weights.get(weight)})
                 self.selection.paths[weight] = detected_from_primary.get(weight) or primary_path
             self.selection.labels[weight] = "auto-detected"
+            return
+
+        if is_yahei_weight(weight):
+            from settings import YAHEI_WEIGHTS
+            detected_cjk = detect_weight_overrides(primary_path, weights=YAHEI_WEIGHTS)
+            yahei_source = next(
+                (detected_cjk.get(w) for w in YAHEI_WEIGHTS if detected_cjk.get(w)),
+                None,
+            )
+            for yahei_weight in YAHEI_WEIGHTS:
+                self.selection.paths[yahei_weight] = yahei_source
+                self.selection.labels[yahei_weight] = (
+                    "auto-detected" if yahei_source else "unset"
+                )
             return
 
         detected = detect_weight_overrides(primary_path, weights={weight: system_weights.get(weight)})

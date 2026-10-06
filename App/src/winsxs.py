@@ -2,7 +2,7 @@ import os
 import re
 from pathlib import Path
 
-from fontTools.ttLib import TTFont, TTLibError
+from fontTools.ttLib import TTFont, TTCollection, TTLibError
 
 from font_detection import infer_family_label_from_strings
 
@@ -51,6 +51,13 @@ EXPECTED_FAMILIES = {
     "lucon.ttf": ("lucida console", None, 650),
     "cascadiacode.ttf": ("cascadia code", "Microsoft Corporation", 1500),
     "cascadiamono.ttf": ("cascadia mono", "Microsoft Corporation", 1500),
+    # Microsoft YaHei collections. Face 0 carries the plain "Microsoft YaHei"
+    # family, so the expected label matches infer_family_label_from_strings.
+    # Glyph floors are per file because WinSxS ships older, smaller builds of
+    # each collection (observed: msyh 30202, msyhbd 29949, msyhl 29816).
+    "msyh.ttc": ("microsoft ya hei", "Microsoft Corporation", (29000, 25000)),
+    "msyhbd.ttc": ("microsoft ya hei", "Microsoft Corporation", (29000, 25000)),
+    "msyhl.ttc": ("microsoft ya hei", "Microsoft Corporation", (29000, 25000)),
 }
 
 _PROFILE_CACHE = {}
@@ -85,6 +92,25 @@ def _glyph_count(font):
         return len(font.getGlyphOrder())
 
 
+def _open_font(path: Path):
+    """Open a font file, transparently handling TrueType collections.
+
+    TTFont() raises TTLibFileIsCollectionError on a .ttc, so collections are
+    opened through TTCollection and described by their first face — the face
+    that carries the plain family name (e.g. "Microsoft YaHei").
+    """
+    if path.suffix.lower() == ".ttc":
+        collection = TTCollection(str(path), lazy=False)
+        try:
+            if not collection.fonts:
+                raise TTLibError(f"Empty font collection: {path.name}")
+            return collection, collection.fonts[0]
+        except Exception:
+            collection.close()
+            raise
+    return None, TTFont(str(path))
+
+
 def _profile(path: Path):
     resolved = str(path.resolve())
     cached = _PROFILE_CACHE.get(resolved)
@@ -92,7 +118,7 @@ def _profile(path: Path):
         return cached
 
     try:
-        font = TTFont(path)
+        collection, font = _open_font(path)
     except (TTLibError, OSError, ValueError):
         _PROFILE_CACHE[resolved] = None
         return None
@@ -124,6 +150,8 @@ def _profile(path: Path):
         return None
     finally:
         font.close()
+        if collection is not None:
+            collection.close()
     _PROFILE_CACHE[resolved] = profile
     return profile
 

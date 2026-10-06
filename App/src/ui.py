@@ -29,7 +29,16 @@ from PySide6.QtWidgets import (
     QLayout,
 )
 
-from settings import APP_GITHUB_URL, APP_NAME, WEIGHT_TARGETS, GITHUB_FONTS_REPO, GITHUB_FONTS_BRANCH, GITHUB_FONTS_URL
+from settings import (
+    APP_GITHUB_URL,
+    APP_NAME,
+    GITHUB_FONTS_BRANCH,
+    GITHUB_FONTS_REPO,
+    GITHUB_FONTS_URL,
+    WEIGHT_TARGETS,
+    YAHEI_DISPLAY_NAMES,
+    is_yahei_weight,
+)
 from core import FontWizardController
 from font_detection import inspect_font
 from operation import OperationResult
@@ -741,12 +750,16 @@ class WeightCard(QFrame):
         self.on_change = on_change
         self.on_reset = on_reset
         colors = get_theme_colors(is_dark, is_windows_11())
-        
-        try:
-            metadata = inspect_font(font_path)
-            detected_weight = metadata.weight_class
-            detected_italic = metadata.is_italic
-        except Exception:
+
+        metadata = None
+        if font_path:
+            try:
+                metadata = inspect_font(font_path)
+                detected_weight = metadata.weight_class
+                detected_italic = metadata.is_italic
+            except Exception:
+                detected_weight, detected_italic = WEIGHT_TARGETS.get(weight, (400, False))
+        else:
             detected_weight, detected_italic = WEIGHT_TARGETS.get(weight, (400, False))
 
         layout = QVBoxLayout(self)
@@ -763,6 +776,8 @@ class WeightCard(QFrame):
             title_str = "Variable UI Font"
         elif weight.startswith("consolas_"):
             title_str = "Monospaced " + weight.replace("consolas_", "").replace("_", " ").title()
+        elif is_yahei_weight(weight):
+            title_str = YAHEI_DISPLAY_NAMES[weight]
         else:
             title_str = weight.replace("_", " ").title()
 
@@ -789,18 +804,22 @@ class WeightCard(QFrame):
         layout.addWidget(header_row)
         
         is_mono = weight.startswith("consolas_")
-        sample_text = "The quick brown fox jumps over the lazy dog"
+        if is_yahei_weight(weight):
+            sample_text = "中文字体预览 · 永和九年 The quick brown fox"
+        else:
+            sample_text = "The quick brown fox jumps over the lazy dog"
         self.preview = QLabel(sample_text)
         self.preview.setObjectName("VariantPreview")
         self.preview.setWordWrap(True)
         self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        
-        self._font_id = QFontDatabase.addApplicationFont(str(font_path))
+
         font_family_name = ""
-        if self._font_id >= 0:
-            families = QFontDatabase.applicationFontFamilies(self._font_id)
-            if families:
-                font_family_name = families[0]
+        if font_path:
+            self._font_id = QFontDatabase.addApplicationFont(str(font_path))
+            if self._font_id >= 0:
+                families = QFontDatabase.applicationFontFamilies(self._font_id)
+                if families:
+                    font_family_name = families[0]
 
         style_str = "italic" if detected_italic else "normal"
         font_family_rule = f"font-family: '{font_family_name}', monospace;" if is_mono and font_family_name else (f"font-family: '{font_family_name}', sans-serif;" if font_family_name else "")
@@ -813,14 +832,20 @@ class WeightCard(QFrame):
         )
         layout.addWidget(self.preview)
 
-        filename_str = Path(font_path).name
-        if weight == "variable":
-            if is_var_file:
-                meta_text = f"Variable Font • {filename_str}"
+        if font_path:
+            filename_str = Path(font_path).name
+            if weight == "variable":
+                if is_var_file:
+                    meta_text = f"Variable Font • {filename_str}"
+                else:
+                    meta_text = f"Static Fallback • Weight {detected_weight} • {filename_str}"
+            elif is_yahei_weight(weight):
+                face_note = f" • {metadata.face_count} faces" if metadata is not None and metadata.face_count > 1 else ""
+                meta_text = f"Chinese (CJK) • Weight {detected_weight}{face_note} • {filename_str}"
             else:
-                meta_text = f"Static Fallback • Weight {detected_weight} • {filename_str}"
+                meta_text = f"Weight {detected_weight}" + (" • Italic" if detected_italic else "") + f" • {filename_str}"
         else:
-            meta_text = f"Weight {detected_weight}" + (" • Italic" if detected_italic else "") + f" • {filename_str}"
+            meta_text = "Not set — Microsoft YaHei will be kept unchanged"
         meta = QLabel(meta_text)
         meta.setObjectName("VariantMeta")
         meta.setStyleSheet(f"color: {colors['text_muted']}; font-size: 11px;")
@@ -960,6 +985,7 @@ class LocalFontsGuide(QWidget):
     POINTS = (
         "Keep all .ttf files in a folder and select Regular file, all other weights including mono will be auto detected",
         "If your font lacks some weights like black italic or variable, closest suited weights will be selected for them",
+        "On Chinese Windows, put a Chinese-capable font (.ttf/.ttc, e.g. 思源黑体 or MiSans) in the folder to also replace Microsoft YaHei, or pick it on the YaHei cards",
         "You have full control over weights detection, you can override all selected weights with your choice",
     )
 
@@ -2887,15 +2913,24 @@ class FontWizardApp(QMainWindow):
         def _handle_card_change(w):
             current_path = self.controller.selection.paths.get(w) or self.controller.selection.paths.get("regular") or "."
             start_dir = str(Path(current_path).parent)
+            is_yahei = is_yahei_weight(w)
             if w == "variable":
                 display_name = "Variable UI Font"
+            elif is_yahei:
+                display_name = YAHEI_DISPLAY_NAMES[w]
             else:
                 display_name = w.replace("consolas_", "Consolas ").replace("_", " ").title()
+            # Only the YaHei slots are backed by TrueType Collections.
+            font_filter = (
+                "TrueType Fonts (*.ttf *.ttc);;All Files (*.*)"
+                if is_yahei
+                else "TrueType Fonts (*.ttf);;All Files (*.*)"
+            )
             chosen_file, _ = QFileDialog.getOpenFileName(
                 self,
                 f"Select Font File for {display_name}",
                 start_dir,
-                "TrueType Fonts (*.ttf);;All Files (*.*)",
+                font_filter,
             )
             if chosen_file:
                 try:
@@ -2913,7 +2948,9 @@ class FontWizardApp(QMainWindow):
         cards_added = 0
         if rebuild_cards:
             for weight, font_path in self.controller.selection.paths.items():
-                if font_path:
+                # YaHei cards are also rendered while unset, so users can
+                # opt in to replacing Microsoft YaHei via the card button.
+                if font_path or is_yahei_weight(weight):
                     try:
                         is_manual = (self.controller.selection.labels.get(weight) == "manual")
                         card = WeightCard(

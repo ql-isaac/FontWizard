@@ -18,7 +18,9 @@ SUPPORTED_WINDOWS_MAJOR = 10
 WINDOWS_10_MIN_BUILD = 10240
 WINDOWS_11_BUILD = 22000
 
-FONT_EXTENSIONS = {".ttf"}
+# Source fonts the picker accepts. Collections are common for CJK families
+# (Source Han Sans / 思源黑体, MiSans) and are only valid for the YaHei slots.
+SOURCE_FONT_EXTENSIONS = {".ttf", ".ttc"}
 MANAGED_FONT_SUFFIX = "_fontwizard"
 
 FONT_REGISTRY_SUBKEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
@@ -51,6 +53,23 @@ CONSOLAS_WEIGHTS = {
     "consolas_bold_italic": "consolaz.ttf",
 }
 
+# Microsoft YaHei ships as TrueType Collections on Chinese (and all)
+# Windows: msyh.ttc holds the Regular/UI faces, msyhbd.ttc the Bold
+# faces and msyhl.ttc the Light faces. Each registry value covers both
+# the "Microsoft YaHei" and "Microsoft YaHei UI" face names.
+#
+# These slots are opt-in: they stay untouched unless the chosen font family
+# actually covers Simplified Chinese, because replacing YaHei with a
+# Latin-only or Japanese/Korean font would degrade Chinese text (falling
+# back to SimSun or rendering Japanese glyph forms). Selecting a CJK-capable
+# font — manually or by sitting in the same folder — is what turns YaHei
+# replacement on. All YaHei weights are always replaced together.
+YAHEI_WEIGHTS = {
+    "yahei_regular": "msyh.ttc",
+    "yahei_bold": "msyhbd.ttc",
+    "yahei_light": "msyhl.ttc",
+}
+
 MONO_COMPANION_FILES = {
     "lucon.ttf": "Lucida Console (TrueType)",
     "CascadiaCode.ttf": "Cascadia Code (TrueType)",
@@ -71,6 +90,9 @@ def get_system_weights(fonts_dir=None):
     if (target_dir / "SegUIVar.ttf").exists():
         weights.update(VARIABLE_WEIGHTS)
     for k, v in CONSOLAS_WEIGHTS.items():
+        if (target_dir / v).exists():
+            weights[k] = v
+    for k, v in YAHEI_WEIGHTS.items():
         if (target_dir / v).exists():
             weights[k] = v
     return weights
@@ -95,6 +117,9 @@ REGISTRY_NAMES = {
     "consolas_bold": "Consolas Bold (TrueType)",
     "consolas_italic": "Consolas Italic (TrueType)",
     "consolas_bold_italic": "Consolas Bold Italic (TrueType)",
+    "yahei_regular": "Microsoft YaHei & Microsoft YaHei UI (TrueType)",
+    "yahei_bold": "Microsoft YaHei Bold & Microsoft YaHei UI Bold (TrueType)",
+    "yahei_light": "Microsoft YaHei Light & Microsoft YaHei UI Light (TrueType)",
 }
 
 WEIGHT_TARGETS = {
@@ -114,7 +139,32 @@ WEIGHT_TARGETS = {
     "consolas_bold":        (700, False),
     "consolas_italic":      (400, True),
     "consolas_bold_italic": (700, True),
+    "yahei_regular":        (400, False),
+    "yahei_bold":           (700, False),
+    "yahei_light":          (300, False),
 }
+
+# Single source of truth for the Microsoft YaHei slot group. Everything the
+# rest of the app needs to know about these slots — which weights exist, how
+# they are labelled in the UI, that they are opt-in and CJK-only, and that
+# they are always replaced as one set — is derived from this table.
+YAHEI_SLOTS = {
+    "yahei_regular": {"label": "Microsoft YaHei", "file": "msyh.ttc"},
+    "yahei_bold": {"label": "Microsoft YaHei Bold", "file": "msyhbd.ttc"},
+    "yahei_light": {"label": "Microsoft YaHei Light", "file": "msyhl.ttc"},
+}
+
+# YaHei slots are opt-in and must only be filled with fonts that render
+# Simplified Chinese; otherwise Chinese text would fall back to SimSun or
+# render Japanese/Korean glyph forms.
+OPTIONAL_WEIGHTS = frozenset(YAHEI_SLOTS)
+CJK_REQUIRED_WEIGHTS = OPTIONAL_WEIGHTS
+
+YAHEI_DISPLAY_NAMES = {weight: slot["label"] for weight, slot in YAHEI_SLOTS.items()}
+
+
+def is_yahei_weight(weight: str) -> bool:
+    return weight in YAHEI_SLOTS
 
 def mod_filename(system_file, source_path=None):
     system_path = Path(system_file)

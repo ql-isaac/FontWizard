@@ -51,25 +51,33 @@ def _has_pending_font_operations(pending_deletions):
     return False
 
 
+_PHYSICAL_CHECK_FONTS = ("segoeui.ttf", "msyh.ttc", "msyhbd.ttc", "msyhl.ttc")
+
+
 def _is_physically_custom(paths=None):
-    active_segoe = FONTS_DIR / "segoeui.ttf"
-    if not active_segoe.exists():
+    for font_name in _PHYSICAL_CHECK_FONTS:
+        if _is_single_font_custom(font_name, paths=paths):
+            return True
+    return False
+
+
+def _is_single_font_custom(font_name, paths=None):
+    active_font = FONTS_DIR / font_name
+    if not active_font.exists():
         return False
 
     if paths and hasattr(paths, "backup_root") and paths.backup_root.exists():
-        backup_segoe = paths.backup_root / "segoeui.ttf"
-        if backup_segoe.exists():
+        backup_font = paths.backup_root / font_name
+        if backup_font.exists():
             try:
-                if _sha256_file(active_segoe) != _sha256_file(backup_segoe):
-                    return True
-                return False
+                return _sha256_file(active_font) != _sha256_file(backup_font)
             except OSError:
                 pass
 
     try:
         from winsxs import expected_entry, is_authentic_font
-        entry = expected_entry("segoeui.ttf")
-        if entry and not is_authentic_font(active_segoe, entry):
+        entry = expected_entry(font_name)
+        if entry and not is_authentic_font(active_font, entry):
             return True
     except Exception:
         pass

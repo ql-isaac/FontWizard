@@ -205,13 +205,24 @@ def schedule_canonical_restore(workflow, font_names: list[str]) -> tuple[int, li
     scheduled_count = 0
 
     for name in font_names:
+        target_path = workflow.active_fonts_root / name
         backup_file = find_original_font_backup(workflow, name)
+
+        # Skip slots that were never replaced (e.g. Microsoft YaHei when
+        # no CJK font was selected): the live file is already identical to
+        # the authentic backup, so scheduling a boot replacement would only
+        # force a pointless reboot.
+        if (
+            backup_file
+            and backup_file.exists()
+            and target_path.exists()
+            and hash_file(target_path) == hash_file(backup_file)
+        ):
+            continue
 
         if not backup_file or not backup_file.exists():
             warnings.append(f"Authentic backup file missing for {name}; skipping restore.")
             continue
-
-        target_path = workflow.active_fonts_root / name
         staged_src = workflow.active_fonts_root / f"staged_restore_{name}"
 
         try:
